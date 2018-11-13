@@ -8,6 +8,8 @@ package duktape
 #include "duk_logging.h"
 #include "duk_v1_compat.h"
 #include "duk_print_alert.h"
+#include <stdbool.h>
+#include <stdio.h>
 static void _duk_eval_string(duk_context *ctx, const char *str) {
   duk_eval_string(ctx, str);
 }
@@ -164,12 +166,173 @@ static void _duk_log(duk_context *ctx, duk_int_t level, const char *str) {
 static void _duk_push_external_buffer(duk_context *ctx) {
 	duk_push_external_buffer(ctx);
 }
+
+extern duk_size_t goDebugReadFunction(void *uData, char *buffer, duk_size_t length);
+extern duk_size_t goDebugWriteFunction(void *uData, char *buffer, duk_size_t length);
+extern duk_size_t goDebugPeekFunction(void *uData);
+extern void goDebugReadFlushFunction(void *uData);
+extern void goDebugWriteFlushFunction(void *uData);
+extern duk_idx_t goDebugRequestFunction(duk_context *ctx, void *uData, duk_idx_t nvalues);
+extern void goDebugDetachedFunction(duk_context *ctx, void *uData);
+
+static void _duk_debugger_attach(duk_context *ctx, bool peek, bool readFlush, bool writeFlush, bool request, void *uData) {
+	duk_debugger_attach(
+		ctx,
+		goDebugReadFunction,
+		((duk_size_t (*)(void*, const char*, duk_size_t)) goDebugWriteFunction),
+		peek ? goDebugPeekFunction : NULL,
+		readFlush ? goDebugReadFlushFunction : NULL,
+		writeFlush ? goDebugWriteFlushFunction : NULL,
+		request ? goDebugRequestFunction : NULL,
+		goDebugDetachedFunction,
+		uData
+	);
+}
 */
 import "C"
 import (
+	"errors"
 	"fmt"
+	"log"
+	"reflect"
+	"sync"
 	"unsafe"
 )
+
+type DebugReadFunction = func(uData unsafe.Pointer, buffer []byte) uint
+type DebugWriteFunction = func(uData unsafe.Pointer, buffer []byte) uint
+type DebugPeekFunction = func(uData unsafe.Pointer) uint
+type DebugReadFlushFunction = func(uData unsafe.Pointer)
+type DebugWriteFlushFunction = func(uData unsafe.Pointer)
+type DebugRequestFunction = func(ctx *Context, uData unsafe.Pointer, nValues int) int
+type DebugDetachedFunction = func(ctx *Context, uData unsafe.Pointer)
+
+type debugger struct {
+	debugReadFunction       DebugReadFunction
+	debugWriteFunction      DebugWriteFunction
+	debugPeekFunction       DebugPeekFunction
+	debugReadFlushFunction  DebugReadFlushFunction
+	debugWriteFlushFunction DebugWriteFlushFunction
+	debugRequestFunction    DebugRequestFunction
+	debugDetachedFunction   DebugDetachedFunction
+
+	uData                   unsafe.Pointer
+}
+
+var debuggerMatrixMutex sync.Mutex
+var debuggerMatrix [128]*debugger
+
+func findDebugger(uData unsafe.Pointer) *debugger {
+	debuggerMatrixMutex.Lock()
+	defer debuggerMatrixMutex.Unlock()
+	index := int(*(*int32)(uData))
+	if index < 0 || len(debuggerMatrix) < index+1 {
+		log.Printf("warning: illegal debugger matrix index received: %d/%d\n", index, len(debuggerMatrix))
+		return nil
+	}
+	return debuggerMatrix[index]
+}
+
+func removeDebugger(uData unsafe.Pointer) *debugger {
+	debuggerMatrixMutex.Lock()
+	defer debuggerMatrixMutex.Unlock()
+	index := int(*(*int32)(uData))
+	if index < 0 || len(debuggerMatrix) < index+1 {
+		log.Printf("warning: illegal debugger matrix index received: %d/%d\n", index, len(debuggerMatrix))
+		return nil
+	}
+	debugger := debuggerMatrix[index]
+	debuggerMatrix[index] = nil
+	C.free(debugger.uData)
+	return debugger
+}
+
+func requestDebuggerSlot() (int32, *debugger) {
+	debuggerMatrixMutex.Lock()
+	defer debuggerMatrixMutex.Unlock()
+	for i := 0; i < 128; i++ {
+		if debuggerMatrix[i] == nil {
+			debuggerMatrix[i] = &debugger{}
+			return int32(i), debuggerMatrix[i]
+		}
+	}
+	return -1, nil
+}
+
+func pointerToSlice(buffer *C.char, length C.duk_size_t) []byte {
+	ptr := uintptr(unsafe.Pointer(buffer))
+	l := int(length)
+	header := reflect.SliceHeader{Data: ptr, Len: l, Cap: l}
+	return *(*[]byte)(unsafe.Pointer(&header))
+}
+
+//export goDebugReadFunction
+func goDebugReadFunction(uData unsafe.Pointer, buffer *C.char, length C.duk_size_t) C.duk_size_t {
+	debugger := findDebugger(uData)
+	if debugger == nil || debugger.debugReadFunction == nil {
+		return 0
+	}
+	data := pointerToSlice(buffer, length)
+	read := (C.duk_size_t)(debugger.debugReadFunction(debugger.uData, data))
+	return read
+}
+
+//export goDebugWriteFunction
+func goDebugWriteFunction(uData unsafe.Pointer, buffer *C.char, length C.duk_size_t) C.duk_size_t {
+	debugger := findDebugger(uData)
+	if debugger == nil || debugger.debugWriteFunction == nil {
+		return 0
+	}
+	data := pointerToSlice(buffer, length)
+	return (C.duk_size_t)(debugger.debugWriteFunction(debugger.uData, data))
+}
+
+//export goDebugPeekFunction
+func goDebugPeekFunction(uData unsafe.Pointer) C.duk_size_t {
+	debugger := findDebugger(uData)
+	if debugger == nil || debugger.debugPeekFunction == nil {
+		return 0
+	}
+	return (C.duk_size_t)(debugger.debugPeekFunction(debugger.uData))
+}
+
+//export goDebugReadFlushFunction
+func goDebugReadFlushFunction(uData unsafe.Pointer) {
+	debugger := findDebugger(uData)
+	if debugger == nil || debugger.debugReadFlushFunction == nil {
+		return
+	}
+	debugger.debugReadFlushFunction(debugger.uData)
+}
+
+//export goDebugWriteFlushFunction
+func goDebugWriteFlushFunction(uData unsafe.Pointer) {
+	debugger := findDebugger(uData)
+	if debugger == nil || debugger.debugWriteFlushFunction == nil {
+		return
+	}
+	debugger.debugWriteFlushFunction(debugger.uData)
+}
+
+//export goDebugRequestFunction
+func goDebugRequestFunction(ctx *C.duk_context, uData unsafe.Pointer, nvalues C.duk_idx_t) C.duk_idx_t {
+	debugger := findDebugger(uData)
+	if debugger == nil || debugger.debugRequestFunction == nil {
+		return 0
+	}
+	c := &Context{&context{duk_context: ctx}}
+	return (C.duk_idx_t)(debugger.debugRequestFunction(c, debugger.uData, int(nvalues)))
+}
+
+//export goDebugDetachedFunction
+func goDebugDetachedFunction(ctx *C.duk_context, uData unsafe.Pointer) {
+	debugger := removeDebugger(uData)
+	if debugger == nil || debugger.debugDetachedFunction == nil {
+		return
+	}
+	c := &Context{&context{duk_context: ctx}}
+	debugger.debugDetachedFunction(c, debugger.uData)
+}
 
 // See: http://duktape.org/api.html#duk_alloc
 func (d *Context) Alloc(size int) unsafe.Pointer {
@@ -1480,24 +1643,68 @@ func (d *Context) PushPointer(p unsafe.Pointer) {
 //---[ Duktape 1.3 API ]--- //
 // See: http://duktape.org/api.html#duk_debugger_attach
 func (d *Context) DebuggerAttach(
-	readFn,
-	writeFn,
-	peekFn,
-	readFlushFn,
-	writeFlushFn,
-	detachedFn *[0]byte,
-	uData unsafe.Pointer) {
-	C.duk_debugger_attach(
+	readFn DebugReadFunction,
+	writeFn DebugWriteFunction,
+	peekFn DebugPeekFunction,
+	readFlushFn DebugReadFlushFunction,
+	writeFlushFn DebugWriteFlushFunction,
+    requestFn DebugRequestFunction,
+	detachedFn DebugDetachedFunction,
+	uData unsafe.Pointer) error {
+
+	index, debugger := requestDebuggerSlot()
+	if index == -1 {
+		return errors.New("could not attach debugger")
+	}
+
+	if readFn == nil {
+		return errors.New("readFn cannot be nil")
+	}
+
+	if writeFn == nil {
+		return errors.New("writeFn cannot be nil")
+	}
+
+	var peek, readFlush, writeFlush, request C.bool = false, false, false, false
+	if peekFn != nil {
+		debugger.debugPeekFunction = peekFn
+		peek = true
+	}
+	if readFlushFn != nil {
+		debugger.debugReadFlushFunction = readFlushFn
+		readFlush = true
+	}
+	if writeFlushFn != nil {
+		debugger.debugWriteFlushFunction = writeFlushFn
+		writeFlush = true
+	}
+	if requestFn != nil {
+		debugger.debugRequestFunction = requestFn
+		request = true
+	}
+
+	// a detached function always exists for cleanup,
+	// therefore we don't need to check here
+	debugger.debugDetachedFunction = detachedFn
+
+	// required functions
+	debugger.debugReadFunction = readFn
+	debugger.debugWriteFunction = writeFn
+
+	debugger.uData = uData
+
+	cData := C.malloc(C.size_t(unsafe.Sizeof(index)))
+	*(*C.int32_t)(cData) = C.int32_t(index)
+
+	C._duk_debugger_attach(
 		d.duk_context,
-		readFn,
-		writeFn,
-		peekFn,
-		readFlushFn,
-		writeFlushFn,
-		nil,
-		detachedFn,
-		uData,
+		peek,
+		readFlush,
+		writeFlush,
+		request,
+		cData,
 	)
+	return nil
 }
 
 // See: http://duktape.org/api.html#duk_debugger_cooperate
